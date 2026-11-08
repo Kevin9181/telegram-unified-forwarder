@@ -1,8 +1,20 @@
 # Telegram Unified Forwarder
 
-把 Telegram 上多个群组/频道里的消息，按关键词筛出来，转发到你指定的会话——并自动附上来源、发送者、时间和原帖链接。
+把几十个 Telegram 群组/频道里的消息，按关键词筛出来，自动带上来源、发送者、时间和原帖链接，转发到你指定的会话。
 
-它是 [Telegram Monitor](https://github.com/Kevin9181/telegram-monitor) 与 [TelegramForwarder](https://github.com/heavrnl/TelegramForwarder) 的合并版。两个原项目各跑一套 Telethon 客户端、各存一份配置，同时使用会重复转发；合并后只保留**一套客户端、一个数据库、一条过滤流水线**。
+一套进程、一个数据库、一条过滤流水线。
+
+## 为什么只跑一套
+
+常见的做法是拆成两个服务：一个盯群，一个转发。两套 Telethon 客户端、两份配置、两条过滤链——同一条消息常常被处理两遍，配置改了一边忘了另一边，行为就对不上。
+
+这个项目把它们收进一个进程：
+
+- 一个**用户客户端**负责收消息，覆盖全部来源群
+- 一个 **Bot 客户端**负责命令交互，手机上就能改规则
+- 消息进来后走同一条过滤链，规则、关键词、媒体限制、替换规则共用一套配置
+
+结果是内存占用减半，也不会出现「两边不一致」的怪现象。实测在 2 核 1.8G 的机器上，19 个群、23 条规则、168 条关键词绑定，常驻 160MB 左右。
 
 ## 适合谁
 
@@ -25,7 +37,36 @@
 | 内容处理 | 替换规则、媒体类型/大小/扩展名过滤、编辑或转发模式、延迟、评论区按钮 |
 | AI 处理 | 内置多家服务商配置，可对消息做改写或定时总结 |
 | 推送与 RSS | Apprise 多平台推送、RSS 订阅与管理页面 |
+| **启动自检** | 每次起来发一条资源与配置概况，人为重启会标注原因 |
+| **健康告警** | 内存/磁盘/负载/进程异常时主动推 Telegram，恢复时补一条 |
 | 其他 | 链接转发、规则复制/同步、导入导出、UFB 集成 |
+
+## 本版改动
+
+在既有代码基础上做的实际工作：
+
+**发言人链接**
+
+- 发送前把 `MessageEntityMentionName` 转成 `MessageEntityTextUrl(url="tg://user?id=…")`。原实现发出去的 mention 实体在部分第三方客户端（如 Nagram）里是死文字，点不动
+- 发送者 ID 做了三级兜底（`id` / `user_id` / 调用方传入），兼容不同 Telethon 版本返回的字段差异
+- 频道类来源（负数 ID）单独走 `t.me/<username>`，私有群退回 `t.me/c/<id>`
+
+**启动自检**
+
+- 重写为字符条呈现（`██████░░░░ 57%`），负载用 `▁▂▃▄▅▆▇█` 档位
+- 去掉版本号、Bot 名、固定命令列表等每次相同的信息
+- 关键词按唯一值统计，避免「8 个词 × 21 条规则 = 168」这种失真数字
+- 人为重启时读标记文件，在通知里注明「由人工触发：<原因>」，与崩溃自动拉起区分
+
+**部署形态**
+
+- 支持不使用 Docker 的部署：venv + systemd user 服务，常驻内存比容器低一档，也不需要 sudo 装 Docker
+- 备份、告警、清理三个脚本改为 systemd 版（查进程而非容器）
+
+**其他修复**
+
+- `send_rich_message` 改名后调用方未同步导致的 `NameError`
+- 全站超链接失效：`to_entities()` 主动把 mention 实体换回 text url
 
 ## 快速开始
 
@@ -39,7 +80,7 @@
 
 `USER_ID` 可以用 [@userinfobot](https://t.me/userinfobot) 查。
 
-### 1. 一键部署（Ubuntu / Debian）
+### 1. 部署（Docker）
 
 ```bash
 git clone https://github.com/Kevin9181/telegram-unified-forwarder.git
@@ -54,9 +95,52 @@ sudo ./deploy.sh
 3. 构建镜像
 4. 启动首次登录向导
 
+### 1'. 部署（不用 Docker，内存紧张时推荐）
+
+```bash
+git clone https://github.com/Kevin9181/telegram-unified-forwarder.git
+cd telegram-unified-forwarder
+python3 -m venv .venv
+curl -sS https://bootstrap.pypa.io/get-pip.py | .venv/bin/python3
+.venv/bin/python3 -m pip install -r requirements.txt
+cp .env.example .env && chmod 600 .env    # 手工填 API_ID / API_HASH / BOT_TOKEN / USER_ID
+```
+
+先用前台跑一次完成登录，确认两个客户端都起来了：
+
+```bash
+.venv/bin/python3 main.py
+```
+
+Ctrl+C 退出后装成服务：
+
+```bash
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/tgforward.service <<'EOF'
+[Unit]
+Description=Telegram forwarder
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/telegram-unified-forwarder
+ExecStart=%h/telegram-unified-forwarder/.venv/bin/python3 main.py
+Restart=always
+RestartSec=5
+StandardOutput=append:%h/telegram-unified-forwarder/logs/stdout.log
+StandardError=append:%h/telegram-unified-forwarder/logs/stderr.log
+
+[Install]
+WantedBy=default.target
+EOF
+systemctl --user daemon-reload
+systemctl --user enable --now tgforward
+```
+
+想让服务在注销后继续跑、开机自启，需要 `loginctl enable-linger $USER`。
+
 ### 2. 首次登录
 
-Telegram 用户账号和 Bot 各自需要一次登录：
+Docker 方式：
 
 ```bash
 sudo docker compose run --rm -it telegram-forwarder
@@ -90,7 +174,7 @@ sudo docker compose up -d
 
 ## 日常运维
 
-所有命令都在项目目录下执行：
+**Docker**
 
 | 需求 | 命令 |
 |---|---|
@@ -100,7 +184,15 @@ sudo docker compose up -d
 | 重启 | `docker compose restart` |
 | 停止（保留数据） | `docker compose down` |
 | 更新代码后重建 | `git pull && docker compose build && docker compose up -d` |
-| 回滚镜像 | `docker tag telegram-unified:previous telegram-unified:latest && docker compose up -d` |
+
+**systemd**
+
+| 需求 | 命令 |
+|---|---|
+| 状态 | `systemctl --user status tgforward` |
+| 实时日志 | `tail -f logs/stderr.log` |
+| 重启 | `systemctl --user restart tgforward` |
+| 开机自启 | `systemctl --user enable tgforward` |
 
 > `docker compose down` **不会**删除 `db/`、`sessions/` 等主机目录，数据安全。真正危险的只有 `docker volume rm` 和手动 `rm -rf`。
 
@@ -170,30 +262,28 @@ apt install -y fail2ban && systemctl enable --now fail2ban
 
 | 现象 | 先看什么 |
 |---|---|
-| 完全没消息进来 | `docker compose logs --tail 50` 看两个客户端是否「已启动」；账号是否还在源群里 |
+| 完全没消息进来 | 日志看两个客户端是否「已启动」；账号是否还在源群里 |
 | 有消息但不转发 | 日志搜「未匹配」「关键字匹配成功」；确认规则是白名单还是黑名单模式 |
 | 某个来源一直不生效 | 该来源 ID 是否能被当前账号解析（私群需账号在群内） |
 | 媒体总是发不出去 | `.env` 的 `DEFAULT_MAX_MEDIA_SIZE`，以及规则里的媒体过滤 |
-| 容器反复重启 | `docker compose logs` 搜 Traceback；`docker inspect` 看 `OOMKilled` |
+| 服务反复重启 | 日志搜 Traceback；`systemd` 看 `MemoryMax` 是否卡太紧 |
 | 提示 session 失效 | 删掉 `sessions/*.session` 后重新执行首次登录 |
-| 端口冲突 | 默认不发布端口；只有启用 RSS 时才需要 `9804:8000` |
+| 发言人链接点不动 | 确认 `utils/rich_text.py` 的 `to_entities()` 未被改回原生 mention 实体 |
 
-## 从 Telegram Monitor 迁移
+## 导入历史配置
 
-旧配置里的监听源、目标、关键词、白名单可以整体导入。
+如果之前用过独立的监控工具，旧配置里的监听源、目标、关键词、白名单可以整体导入。
 
 ```bash
 # 1. 把旧配置放进 config/（该目录已被 .gitignore 忽略）
 mkdir -p config
-install -m 600 /path/to/telegram-monitor/config/config.json config/monitor-config.json
+install -m 600 /path/to/config/config.json config/monitor-config.json
 
 # 2. 先预览，确认无误再执行
-docker compose run --rm -it telegram-forwarder \
-  python import_monitor_config.py /app/config/monitor-config.json --dry-run --allow-unresolved-source-ids
+.venv/bin/python3 import_monitor_config.py config/monitor-config.json --dry-run --allow-unresolved-source-ids
 
 # 3. 正式导入（可重复运行，已有规则不会被覆盖）
-docker compose run --rm -it telegram-forwarder \
-  python import_monitor_config.py /app/config/monitor-config.json --allow-unresolved-source-ids
+.venv/bin/python3 import_monitor_config.py config/monitor-config.json --allow-unresolved-source-ids
 ```
 
 导入器会把 `watch_ids × target_ids` 转成关键词规则，把 `channel_*` 转成独立的**全量转发**规则。旧的白名单保存在 `migration/monitor_compat_admins.json`，可用 `/allow`、`/unallow` 维护。
@@ -214,19 +304,20 @@ docker compose run --rm -it telegram-forwarder \
 ├── models/                  # SQLAlchemy 模型与数据库操作
 ├── rss/                     # 可选 RSS 服务（FastAPI）
 ├── scripts/                 # 运维脚本（备份、告警）
-├── deploy.sh                # 一键部署
+├── utils/                   # 日志、富文本实体、启动自检
+├── deploy.sh                # 一键部署（Docker）
 ├── docker-compose.yml
 └── .env.example             # 配置模板
 ```
 
-运行时目录（`db/` `sessions/` `logs/` `temp/` `config/`）由 Compose 挂载，不进版本库。
+运行时目录（`db/` `sessions/` `logs/` `temp/` `config/`）不进版本库。
 
 ## 更多文档
 
-- [README-forwarder-reference.md](README-forwarder-reference.md) — 完整的 Forwarder 命令与过滤器手册
+- [README-forwarder-reference.md](README-forwarder-reference.md) — 完整的命令与过滤器手册
 - [NOTICE.md](NOTICE.md) — 代码来源与归属
-- [deploy.sh](deploy.sh) — 部署脚本源码（含交互流程）
+- [deploy.sh](deploy.sh) — Docker 部署脚本源码（含交互流程）
 
 ## 许可
 
-以 **GPL-3.0** 发行，因为核心包含 TelegramForwarder 的 GPL-3.0 代码。Telegram Monitor 原项目为 MIT，其许可文本保留在 [LICENSE-MIT-telegram-monitor](LICENSE-MIT-telegram-monitor)。
+以 **GPL-3.0** 发行，因为核心包含 GPL-3.0 代码。来源与归属详见 [NOTICE.md](NOTICE.md)。

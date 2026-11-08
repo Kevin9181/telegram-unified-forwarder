@@ -18,7 +18,15 @@ CHAT_ID="$(grep -m1 '^USER_ID=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '
 AVAIL="$(free -m | awk '/^Mem:/{print $7}')"
 DISK="$(df -P / | awk 'NR==2{gsub("%","",$5); print $5}')"
 SWAP="$(free -m | awk '/^Swap:/{print $3}')"
-HEALTH="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$CONTAINER" 2>/dev/null || true)"
+
+# RUN_MODE=docker（默认）查容器健康状态；RUN_MODE=systemd 查进程在不在
+RUN_MODE="${RUN_MODE:-docker}"
+PROCESS_PATTERN="${PROCESS_PATTERN:-main.py}"
+if [ "$RUN_MODE" = "systemd" ]; then
+  if pgrep -f "$PROCESS_PATTERN" >/dev/null 2>&1; then HEALTH="running"; else HEALTH="down"; fi
+else
+  HEALTH="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$CONTAINER" 2>/dev/null || true)"
+fi
 
 MSG=""
 add() { MSG="${MSG}$1"$'\n'; }
@@ -26,10 +34,14 @@ add() { MSG="${MSG}$1"$'\n'; }
 if [ "${AVAIL:-999}" -lt "$MIN_AVAIL_MB" ]; then add "⚠️ 内存可用仅 ${AVAIL}MB"; fi
 if [ "${DISK:-0}" -gt "$MAX_DISK_PCT" ]; then add "⚠️ 磁盘使用 ${DISK}%"; fi
 if [ "${SWAP:-0}" -gt "$MAX_SWAP_MB" ]; then add "⚠️ Swap 已用 ${SWAP}MB"; fi
-case "$HEALTH" in
-  healthy|starting) ;;
-  *) add "⚠️ 容器 ${CONTAINER} 状态: ${HEALTH:-不存在}" ;;
-esac
+if [ "$RUN_MODE" = "systemd" ]; then
+  [ "$HEALTH" = "running" ] || add "🚨 转发进程未运行"
+else
+  case "$HEALTH" in
+    healthy|starting) ;;
+    *) add "⚠️ 容器 ${CONTAINER} 状态: ${HEALTH:-不存在}" ;;
+  esac
+fi
 
 send() {
   [ -n "$BOT_TOKEN" ] && [ -n "$CHAT_ID" ] || return 0
@@ -40,7 +52,7 @@ send() {
 
 if [ "${1:-}" = "--test" ]; then
   send "🖥 $(hostname) 告警测试
-内存可用 ${AVAIL}MB / 磁盘 ${DISK}% / Swap ${SWAP}MB / 容器 ${HEALTH}
+内存可用 ${AVAIL}MB / 磁盘 ${DISK}% / Swap ${SWAP}MB / 服务 ${HEALTH}
 收到这条说明通知链路正常。"
   exit 0
 fi
