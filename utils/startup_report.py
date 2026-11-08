@@ -4,9 +4,34 @@ import shutil
 import sqlite3
 
 
+def _bar(pct, width=10):
+    """百分比 → 字符条。"""
+    try:
+        pct = max(0.0, min(100.0, float(pct)))
+    except (TypeError, ValueError):
+        return '░' * width
+    filled = int(round(pct * width / 100.0))
+    return '█' * filled + '░' * (width - filled)
+
+
+def _load_glyph(load1, cores):
+    """负载 → 档位字符，0~2 倍核数映射到 8 档。"""
+    try:
+        ratio = float(load1) / max(1, int(cores))
+    except (TypeError, ValueError):
+        return '▁'
+    idx = min(7, max(0, int(ratio * 4)))
+    return '▁▂▃▄▅▆▇█'[idx]
+
+
 def collect_stats(db_path):
     """采集启动时的基本信息，任何一项失败都只跳过该字段。"""
     stats = {}
+
+    try:
+        stats['cores'] = os.cpu_count() or 1
+    except Exception:
+        pass
 
     try:
         memory = {}
@@ -19,6 +44,7 @@ def collect_stats(db_path):
         if total:
             stats['mem_total'] = total
             stats['mem_used'] = total - available
+            stats['mem_available'] = available
     except Exception:
         pass
 
@@ -41,7 +67,10 @@ def collect_stats(db_path):
             stats['rules_keyword'] = cursor.execute(
                 'select count(*) from forward_rules where is_monitor_compat=1'
             ).fetchone()[0]
-            stats['keywords'] = cursor.execute('select count(*) from keywords').fetchone()[0]
+            # 唯一关键词数。keywords 表按规则各存一份，直接 count(*) 会把 8 个词算成 168
+            stats['keywords'] = cursor.execute(
+                'select count(distinct keyword) from keywords'
+            ).fetchone()[0]
             stats['chats'] = cursor.execute('select count(*) from chats').fetchone()[0]
     except Exception:
         pass
@@ -50,50 +79,39 @@ def collect_stats(db_path):
 
 
 def render_report(now, version, bot_label, user_label, stats):
-    """把采集到的数据渲染成一条 HTML 消息。"""
-    lines = ['<b>🚀 服务已启动</b>', '']
+    """渲染启动通知。只保留核心：时间、资源水位、配置规模。"""
+    lines = ['<b>✅ 服务正常</b> · %s' % now.strftime('%H:%M'), '']
 
-    env_lines = [f"🕐 {now.strftime('%Y-%m-%d %H:%M:%S')}", f'📦 v{version}']
-    if user_label:
-        env_lines.append(f'👤 {user_label}')
-    env_lines.append(f'🤖 {bot_label}')
-    lines.append('<blockquote>' + '\n'.join(env_lines) + '</blockquote>')
+    rows = []
+    if 'mem_total' in stats:
+        pct = stats['mem_used'] / stats['mem_total'] * 100
+        rows.append('内存  %s  %d%%   %dMB 可用'
+                    % (_bar(pct), pct, stats.get('mem_available', 0)))
+    if 'disk_used_pct' in stats:
+        rows.append('磁盘  %s  %d%%   %.0fG 可用'
+                    % (_bar(stats['disk_used_pct']), stats['disk_used_pct'],
+                       stats.get('disk_free_gb', 0)))
+    if 'load' in stats:
+        rows.append('负载  %s  %.2f'
+                    % (_load_glyph(stats['load'][0], stats.get('cores', 1)), stats['load'][0]))
+    if rows:
+        lines.extend(rows)
+        lines.append('')
 
     if 'rules_total' in stats:
-        keyword_rules = stats['rules_keyword']
-        full_rules = stats['rules_total'] - keyword_rules
-        lines.append(
-            '<blockquote>'
-            f"📋 转发规则 {stats['rules_total']} 条（关键词 {keyword_rules} · 全量 {full_rules}）\n"
-            f"🔑 关键词 {stats['keywords']} 个 · 💬 会话缓存 {stats['chats']} 个"
-            '</blockquote>'
-        )
-
-    resource_lines = []
-    if 'mem_total' in stats:
-        resource_lines.append(f"💾 内存 {stats['mem_used']} / {stats['mem_total']} MB")
-    if 'disk_used_pct' in stats:
-        resource_lines.append(f"🗄 磁盘 {stats['disk_used_pct']:.0f}%（剩 {stats['disk_free_gb']:.1f} GB）")
-    if 'load' in stats:
-        load1, load5, load15 = stats['load']
-        resource_lines.append(f'📈 负载 {load1:.2f} / {load5:.2f} / {load15:.2f}')
-    if resource_lines:
-        lines.append('<blockquote>' + '\n'.join(resource_lines) + '</blockquote>')
+        lines.append('%d 条规则 · %d 个监听源 · %d 个关键词'
+                     % (stats['rules_total'], stats.get('rules_keyword', 0),
+                        stats.get('keywords', 0)))
 
     tips = []
     if stats.get('disk_used_pct', 0) >= 85:
-        tips.append('⚠️ 磁盘剩余空间不足，建议尽快清理')
+        tips.append('⚠️ 磁盘快满了，建议清理')
     if stats.get('mem_total') and stats['mem_used'] / stats['mem_total'] >= 0.9:
-        tips.append('⚠️ 内存吃紧，留意是否频繁换页')
+        tips.append('⚠️ 内存吃紧，留意换页')
     if stats.get('rules_total') == 0:
-        tips.append('💡 还没有规则，用 /bind <来源> [目标] 建立第一条')
-    if not tips:
-        tips.append('✅ 启动自检通过，正在监听消息')
-    lines.append('<blockquote>' + '\n'.join(tips) + '</blockquote>')
-
-    lines.append('<b>常用命令</b>')
-    lines.append('/settings 管理规则 · /list_rule 查看全部 · /show 查看配置 · /changelog 更新日志')
-    lines.append('')
-    lines.append('<i>基于 TelegramForwarder（GPL-3.0）与 Telegram Monitor 合并</i>')
+        tips.append('💡 还没有规则，用 /bind <来源> [目标] 建第一条')
+    if tips:
+        lines.append('')
+        lines.extend(tips)
 
     return '\n'.join(lines)

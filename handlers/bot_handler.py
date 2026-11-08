@@ -1,6 +1,7 @@
 from telethon import events
 import html
 import json
+import os
 from handlers.button.callback.callback_handlers import handle_callback
 from handlers.command_handlers import *
 from handlers.monitor_compat import handle_legacy_monitor_command
@@ -255,5 +256,16 @@ async def _send_startup_report(client, user_client=None):
         html.escape(user_label),
         stats,
     )
+    # 手动操作标记：谁重启的、为什么。没有标记就是意外重启。
+    flag = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.restart_flag')
+    if os.path.exists(flag):
+        try:
+            with open(flag, encoding='utf-8') as fh:
+                reason = fh.read().strip() or '手动重启'
+            text += "\n\n🛠 <i>本次启动由人工触发：%s</i>" % html.escape(reason)
+            os.remove(flag)
+        except Exception:
+            pass
+
     await client.send_message(user_id, text, parse_mode='html', link_preview=False)
     logger.info("已发送启动通知")
