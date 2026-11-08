@@ -1,7 +1,9 @@
 """启动自检报告：采集主机/数据库概况并渲染成 Telegram HTML 消息。"""
+import html
 import os
 import shutil
 import sqlite3
+import unicodedata
 
 
 def _bar(pct, width=10):
@@ -12,6 +14,19 @@ def _bar(pct, width=10):
         return '░' * width
     filled = int(round(pct * width / 100.0))
     return '█' * filled + '░' * (width - filled)
+
+
+def _w(text):
+    """按终端显示宽度算长度：中日韩字符占 2 格。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1 for ch in text)
+
+
+def _rpad(text, width):
+    return text + ' ' * max(0, width - _w(text))
+
+
+def _lpad(text, width):
+    return ' ' * max(0, width - _w(text)) + text
 
 
 def _load_glyph(load1, cores):
@@ -80,20 +95,22 @@ def collect_stats(db_path):
 
 def render_report(now, version, bot_label, user_label, stats):
     """渲染启动通知。只保留核心：时间、资源水位、配置规模。"""
-    lines = ['<b>✅ 服务正常</b> · %s' % now.strftime('%H:%M'), '']
+    lines = ['✅ 服务正常 · %s' % now.strftime('%H:%M'), '']
 
     rows = []
     if 'mem_total' in stats:
         pct = stats['mem_used'] / stats['mem_total'] * 100
-        rows.append('内存  %s  %d%%   %dMB 可用'
-                    % (_bar(pct), pct, stats.get('mem_available', 0)))
+        rows.append('内存  %s  %s  %s 可用' % (
+            _bar(pct), _lpad('%d%%' % pct, 4),
+            _lpad('%dMB' % stats.get('mem_available', 0), 6)))
     if 'disk_used_pct' in stats:
-        rows.append('磁盘  %s  %d%%   %.0fG 可用'
-                    % (_bar(stats['disk_used_pct']), stats['disk_used_pct'],
-                       stats.get('disk_free_gb', 0)))
+        rows.append('磁盘  %s  %s  %s 可用' % (
+            _bar(stats['disk_used_pct']), _lpad('%d%%' % stats['disk_used_pct'], 4),
+            _lpad('%.1fG' % stats.get('disk_free_gb', 0), 6)))
     if 'load' in stats:
-        rows.append('负载  %s  %.2f'
-                    % (_load_glyph(stats['load'][0], stats.get('cores', 1)), stats['load'][0]))
+        rows.append('负载  %s%s' % (
+            _rpad(_load_glyph(stats['load'][0], stats.get('cores', 1)), 12),
+            _lpad('%.2f' % stats['load'][0], 4)))
     if rows:
         lines.extend(rows)
         lines.append('')
@@ -114,4 +131,4 @@ def render_report(now, version, bot_label, user_label, stats):
         lines.append('')
         lines.extend(tips)
 
-    return '\n'.join(lines)
+    return '<pre>%s</pre>' % html.escape('\n'.join(lines))
