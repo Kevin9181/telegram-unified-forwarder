@@ -17,23 +17,26 @@ def is_html(parse_mode):
 
 
 def to_entities(markup):
-    """HTML -> (纯文本, 实体列表)，其中 tg://user 链接转成 MentionName。"""
+    """HTML -> (纯文本, 实体列表)。
+
+    Telethon 的 HTML 解析器会把 <a href="tg://user?id=N"> 转成
+    MessageEntityMentionName，而 iOS 第三方客户端（Nagram）只把 TextUrl 渲染成超链。
+    这里把 MentionName 换回 TextUrl：显示文字不变，链接可点，也不依赖用户名。
+    """
     text, entities = html_parser.parse(markup)
 
     converted = []
     for entity in entities:
-        if isinstance(entity, MessageEntityTextUrl):
-            match = _USER_LINK.match(entity.url or "")
-            if match:
-                converted.append(
-                    MessageEntityMentionName(
-                        offset=entity.offset,
-                        length=entity.length,
-                        user_id=int(match.group(1)),
-                    )
+        if isinstance(entity, MessageEntityMentionName):
+            converted.append(
+                MessageEntityTextUrl(
+                    offset=entity.offset,
+                    length=entity.length,
+                    url=f"tg://user?id={entity.user_id}",
                 )
-                continue
-        converted.append(entity)
+            )
+        else:
+            converted.append(entity)
 
     return text, converted
 

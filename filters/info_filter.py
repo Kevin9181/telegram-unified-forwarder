@@ -28,8 +28,8 @@ def _as_link(text, url, message_mode):
     return text
 
 
-def _sender_url(sender, sender_chat):
-    """用户 → tg://user 深链；频道身份 → 频道自身链接。"""
+def _sender_url(sender, sender_chat, fallback_id=None):
+    """用户 → 优先 t.me/<username>，无用户名退回 tg://user；频道身份 → 频道自身链接。"""
     if sender_chat is not None:
         username = getattr(sender_chat, "username", None)
         if username:
@@ -40,7 +40,22 @@ def _sender_url(sender, sender_chat):
         return ""
     # 用户：一律用 tg://user?id=<数字ID>。
     # 用户名可能被修改，t.me/<username> 会随之失效；数字 ID 永久不变。
-    sender_id = getattr(sender, "id", None)
+    sender_id = (
+        getattr(sender, "id", None)
+        or getattr(sender, "user_id", None)
+        or fallback_id
+    )
+    # 负数 ID 是频道/群：send_as 频道发言时 sender_chat 可能为空、sender 解析成 Channel，
+    # 直接塞进 tg://user 会生成无效链接，客户端点了没反应
+    if sender_id is not None and sender_id < 0:
+        username = getattr(sender, "username", None)
+        if username:
+            return f"https://t.me/{username}"
+        if str(sender_id).startswith("-100"):
+            return f"https://t.me/c/{str(sender_id)[4:]}"
+        return ""
+    # 用户：一律用数字 ID。rich_text 会把实体转成 TextUrl（不是 MentionName），
+    # Nagram 认得，且不依赖用户名
     return f"tg://user?id={sender_id}" if sender_id else ""
 
 
@@ -105,8 +120,14 @@ class InfoFilter(BaseFilter):
                         or str(getattr(sender, "id", ""))
                     )
                     sender_name = _escape_for_parse_mode(sender_name, mode)
-                    sender_display = _as_link(sender_name, _sender_url(sender, sender_chat), mode)
-                    if sender_chat is not None:
+                    _surl = _sender_url(sender, sender_chat, getattr(event, "sender_id", None))
+                    logger.info(
+                        "发言人解析: type=%s id=%s user_id=%s sender_chat=%s sender_id=%s url=%s"
+                        % (type(sender).__name__, getattr(sender, "id", None), getattr(sender, "user_id", None),
+                           sender_chat is not None, getattr(event, "sender_id", None), _surl or "(无)")
+                    )
+                    sender_display = _as_link(sender_name, _surl, mode)
+                    if sender_chat is not None or (getattr(sender, "id", 0) or 0) < 0:
                         sender_icon = "📺"
 
                 message_date = getattr(event.message, "date", None)

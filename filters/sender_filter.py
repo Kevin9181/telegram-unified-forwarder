@@ -3,6 +3,7 @@ import os
 from filters.base_filter import BaseFilter
 from enums.enums import PreviewMode
 from telethon.errors import FloodWaitError
+from utils.rich_text import send_message as send_rich_message  # 兼容旧调用名
 
 logger = logging.getLogger(__name__)
 
